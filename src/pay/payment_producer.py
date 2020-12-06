@@ -2,11 +2,12 @@ import _thread
 import csv
 import os
 import threading
-import time
 
+from time import sleep
 from datetime import datetime, timedelta
+
 from Constants import RunMode, PaymentStatus
-from log_config import main_logger
+from log_config import main_logger, get_verbose_log_helper
 from model.reward_log import RewardLog
 from model.rules_model import RulesModel
 from exception.api_provider import ApiProviderException
@@ -19,7 +20,7 @@ from calc.phased_payment_calculator import PhasedPaymentCalculator
 from util.dir_utils import get_calculation_report_file, get_failed_payments_dir, PAYMENT_FAILED_DIR, PAYMENT_DONE_DIR, \
     remove_busy_file, BUSY_FILE
 
-logger = main_logger
+logger = main_logger.getChild("payment_producer")
 
 MUTEZ = 1e+6
 BOOTSTRAP_SLEEP = 8
@@ -28,8 +29,8 @@ BOOTSTRAP_SLEEP = 8
 class PaymentProducer(threading.Thread, PaymentProducerABC):
     def __init__(self, name, initial_payment_cycle, network_config, payments_dir, calculations_dir, run_mode,
                  service_fee_calc, release_override, payment_offset, baking_cfg, payments_queue, life_cycle,
-                 dry_run, wllt_clnt_mngr, node_url, provider_factory, node_url_public='', verbose=False,
-                 api_base_url=None, retry_injected=False):
+                 dry_run, wllt_clnt_mngr, node_url, provider_factory, node_url_public='', api_base_url=None,
+                 retry_injected=False):
         super(PaymentProducer, self).__init__()
         self.rules_model = RulesModel(baking_cfg.get_excluded_set_tob(), baking_cfg.get_excluded_set_toe(),
                                       baking_cfg.get_excluded_set_tof(), baking_cfg.get_dest_map())
@@ -47,6 +48,13 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
             network_config, self.baking_address, self.node_url, node_url_public, api_base_url)
         self.block_api = provider_factory.newBlockApi(network_config, self.node_url, api_base_url)
 
+        dexter_contracts_set = baking_cfg.get_contracts_set()
+        if len(dexter_contracts_set) > 0 and not (self.reward_api.name == 'tzstats'):
+            logger.warning("The Dexter functionality is currently only supported using tzstats."
+                           "The contract address will be treated as a normal delegator.")
+        else:
+            self.reward_api.set_dexter_contracts_set(dexter_contracts_set)
+
         self.fee_calc = service_fee_calc
         self.initial_payment_cycle = initial_payment_cycle
         self.nw_config = network_config
@@ -57,7 +65,6 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
 
         self.release_override = release_override
         self.payment_offset = payment_offset
-        self.verbose = verbose
         self.payments_queue = payments_queue
         self.life_cycle = life_cycle
         self.dry_run = dry_run
@@ -85,7 +92,7 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
     def retry_fail_run(self):
         logger.info('Retry Fail thread "{}" started'.format(self.retry_fail_thread.name))
 
-        time.sleep(60)  # producer thread already tried once, wait for next try
+        sleep(60)  # producer thread already tried once, wait for next try
 
         while not self.exiting and self.life_cycle.is_running():
             self.retry_failed_payments()
@@ -107,7 +114,7 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
         if not self.run_mode == RunMode.ONETIME:
             self.retry_failed_payments()
             if self.run_mode == RunMode.RETRY_FAILED:
-                time.sleep(5)
+                sleep(5)
                 self.exit()
                 return
 
@@ -115,8 +122,13 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
         if self.run_mode == RunMode.FOREVER:
             self.retry_fail_thread.start()
 
-        current_cycle = self.block_api.get_current_cycle()
-        pymnt_cycle = self.initial_payment_cycle
+        try:
+            current_cycle = self.block_api.get_current_cycle()
+            pymnt_cycle = self.initial_payment_cycle
+        except ApiProviderException as a:
+            logger.error("Unable to fetch current cycle, {:s}. Exiting.".format(str(a)))
+            self.exit()
+            return
 
         # if non-positive initial_payment_cycle, set initial_payment_cycle to
         # 'current cycle - abs(initial_cycle) - (NB_FREEZE_CYCLE+1)'
@@ -124,22 +136,23 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
             pymnt_cycle = current_cycle - abs(self.initial_payment_cycle) - (self.nw_config['NB_FREEZE_CYCLE'] + 1)
             logger.debug("Payment cycle is set to {}".format(pymnt_cycle))
 
+        get_verbose_log_helper().reset(pymnt_cycle)
+
         while not self.exiting and self.life_cycle.is_running():
 
             # take a breath
-            time.sleep(5)
+            sleep(5)
 
             try:
 
                 # Check if local node is bootstrapped; sleep if needed; restart loop
                 if not self.node_is_bootstrapped():
-                    logger.info("Local node, {}, is not in sync with the Tezos network. Will sleep for {} blocks and check again."
-                                .format(self.node_url, BOOTSTRAP_SLEEP))
+                    logger.info("Local node, {}, is not in sync with the Tezos network. Will sleep for {} blocks and check again." .format(self.node_url, BOOTSTRAP_SLEEP))
                     self.wait_for_blocks(BOOTSTRAP_SLEEP)
                     continue
 
                 # Local node is ready
-                current_level = self.block_api.get_current_level(verbose=self.verbose)
+                current_level = self.block_api.get_current_level()
                 current_cycle = self.block_api.level_to_cycle(current_level)
                 level_in_cycle = self.block_api.level_in_cycle(current_level)
 
@@ -147,11 +160,8 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
                 if self.calculations_dir and not os.path.exists(self.calculations_dir):
                     os.makedirs(self.calculations_dir)
 
-                logger.debug("Checking for pending payments : payment_cycle <= "
-                             "current_cycle - (self.nw_config['NB_FREEZE_CYCLE'] + 1) - self.release_override")
-                logger.info("Checking for pending payments : checking {} <= {} - ({} + 1) - {}".
-                            format(pymnt_cycle, current_cycle, self.nw_config['NB_FREEZE_CYCLE'],
-                                   self.release_override))
+                logger.debug("Checking for pending payments : payment_cycle <= current_cycle - (self.nw_config['NB_FREEZE_CYCLE'] + 1) - self.release_override")
+                logger.info("Checking for pending payments : checking {} <= {} - ({} + 1) - {}".format(pymnt_cycle, current_cycle, self.nw_config['NB_FREEZE_CYCLE'], self.release_override))
 
                 # payments should not pass beyond last released reward cycle
                 if pymnt_cycle <= current_cycle - (self.nw_config['NB_FREEZE_CYCLE'] + 1) - self.release_override:
@@ -159,27 +169,26 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
 
                         # Paying upcoming cycles (-R in [-6, -11] )
                         if pymnt_cycle >= current_cycle:
-                            if self.reward_api.name == 'tzstats':
+                            if self.reward_api.name == 'tzstats' or self.reward_api.name == 'tzkt':
                                 logger.warn("Please note that you are doing payouts for future rewards!!! These rewards are not earned yet, they are an estimation given by tzstats.")
                                 result = self.try_to_pay(pymnt_cycle, expected_reward=True)
                             else:
-                                logger.error("This feature is only possible using tzstats. Please consider changing the provider using the -P flag.")
+                                logger.error("This feature is currently not possible using the rpc provider. Please consider changing the provider using the -P flag.")
                                 self.exit()
                                 break
                         # Paying cycles with frozen rewards (-R in [-1, -5] )
                         elif pymnt_cycle >= current_cycle - self.nw_config['NB_FREEZE_CYCLE']:
-                            if self.reward_api.name == 'tzstats':
+                            if self.reward_api.name == 'tzstats' or self.reward_api.name == 'tzkt':
                                 logger.warn("Please note that you are doing payouts for frozen rewards!!!")
                                 result = self.try_to_pay(pymnt_cycle)
                             else:
-                                logger.error("This feature is only possible using tzstats. Please consider changing the provider using the -P flag or wait until the rewards are unfrozen.")
+                                logger.error("This feature is currently not possible using the rpc provider. Please consider changing the provider using the -P flag.")
                                 self.exit()
                                 break
                         # If user wants to offset payments within a cycle, check here
                         elif level_in_cycle < self.payment_offset:
                             wait_offset_blocks = self.payment_offset - level_in_cycle
-                            logger.info("Current level within the cycle is {}; Requested offset is {}; Waiting for {} more blocks."
-                                        .format(level_in_cycle, self.payment_offset, wait_offset_blocks))
+                            logger.info("Current level within the cycle is {}; Requested offset is {}; Waiting for {} more blocks." .format(level_in_cycle, self.payment_offset, wait_offset_blocks))
                             self.wait_for_blocks(wait_offset_blocks)
                             continue  # Break/Repeat loop
                         else:
@@ -193,12 +202,13 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
                                 break
                             else:
                                 pymnt_cycle = pymnt_cycle + 1
+                                get_verbose_log_helper().reset(pymnt_cycle)
 
                     # end of queue size check
                     else:
                         logger.debug("Wait a few minutes, queue is full")
                         # wait a few minutes to let payments finish
-                        time.sleep(60 * 3)
+                        sleep(60 * 3)
 
                 # end of payment cycle check
                 else:
@@ -210,7 +220,7 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
                         self.exit()
                         break
 
-                    time.sleep(10)
+                    sleep(10)
 
                     # calculate number of blocks until end of current cycle
                     nb_blocks_remaining = (current_cycle + 1) * self.nw_config['BLOCKS_PER_CYCLE'] - current_level
@@ -223,11 +233,14 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
                     # wait until current cycle ends
                     self.wait_for_blocks(nb_blocks_remaining)
 
-            except ApiProviderException:
-                logger.debug("{} API error at reward loop".format(self.reward_api.name), exc_info=True)
-                logger.info("{} API error at reward loop, will try again.".format(self.reward_api.name))
-            except Exception:
-                logger.error("Error at payment producer loop", exc_info=True)
+            except (ApiProviderException, ReadTimeout, ConnectTimeout) as e:
+                logger.debug("{:s} error at payment producer loop: '{:s}'".format(self.reward_api.name, str(e)), exc_info=True)
+                logger.error("{:s} error at payment producer loop: '{:s}', will try again.".format(
+                             self.reward_api.name, str(e)))
+
+            except Exception as e:
+                logger.debug("Unknown error in payment producer loop: {:s}".format(str(e)), exc_info=True)
+                logger.error("Unknown error in payment producer loop: {:s}, will try again.".format(str(e)))
 
         # end of endless loop
         logger.info("Producer returning ...")
@@ -257,7 +270,7 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
             # 2- calculate rewards
             reward_logs, total_amount = self.payment_calc.calculate(reward_model)
 
-            # set cycle info
+            # 3- set cycle info
             for rl in reward_logs:
                 rl.cycle = pymnt_cycle
             total_amount_to_pay = sum([rl.amount for rl in reward_logs if rl.payable])
@@ -274,7 +287,7 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
 
                 logger.debug("Creating calculation report (%s)", report_file_path)
 
-                time.sleep(5.0)
+                sleep(5.0)
 
                 # 6- create calculations report file. This file contains calculations details
                 self.create_calculations_report(reward_logs, report_file_path, total_amount)
@@ -285,28 +298,19 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
             elif total_amount_to_pay == 0:
                 logger.info("Total payment amount is 0. Nothing to pay!")
 
-            return True
-        except ReadTimeout:
-            logger.info("API provider call failed, will try again.")
-            logger.debug("API provider call failed", exc_info=False)
-            return False
-        except ConnectTimeout:
-            logger.info("API provider connection failed, will try again.")
-            logger.debug("API provider connection failed", exc_info=False)
-            return False
-        except ApiProviderException:
-            logger.info("API provider error at reward loop, will try again.")
-            logger.debug("API provider error at reward loop", exc_info=False)
-            return False
+        except ApiProviderException as a:
+            logger.error("[try_to_pay] API provider error {:s}".format(str(a)))
+            raise a from a
         except Exception as e:
-            logger.error("Error at payment producer loop: '{}', will try again.".format(e), exc_info=True)
-            return False
-        finally:
-            time.sleep(10)
+            logger.error("[try_to_pay] Generic exception {:s}".format(str(e)))
+            raise e from e
+
+        # Either succeeded or raised exception
+        return True
 
     def wait_for_blocks(self, nb_blocks_remaining):
         for x in range(nb_blocks_remaining):
-            time.sleep(self.nw_config['BLOCK_TIME_IN_SEC'])
+            sleep(self.nw_config['BLOCK_TIME_IN_SEC'])
 
             # if shutting down, exit
             if not self.life_cycle.is_running():
@@ -417,7 +421,7 @@ class PaymentProducer(threading.Thread, PaymentProducerABC):
             # make sure the queue is not full
             while self.payments_queue.full():
                 logger.debug("Payments queue is full. Wait a few minutes.")
-                time.sleep(60 * 3)
+                sleep(60 * 3)
 
             cycle = int(os.path.splitext(os.path.basename(payment_failed_report_file))[0])
 
